@@ -1,0 +1,43 @@
+# ===================================================================
+#  Visual Studio / MSBuild specific files
+# ===================================================================
+# User-specific options, build states, and temporary files.
+*.suo
+*.user
+*.user.*
+*.aps
+*.vs
+*.vs.*
+*.vcxproj.user
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+Win32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+[Ii][Pp][Aa]/
+
+# Build log files
+*.tlog
+
+# ===================================================================
+#  Common compiled outputs
+# ===================================================================
+*.exe
+*.dll
+*.obj
+*.o
+#*.lib
+*.pdb
+*.ilk
+*.exp
+*.map
+
+# ===================================================================
+#  Exceptions - Files to KEEP
+# ===================================================================
+# This section is for files i WANT to keep, even if they match a rule above.
+!/lib/
+!/include/
