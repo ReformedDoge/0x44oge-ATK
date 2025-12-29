@@ -85,6 +85,7 @@ void LoadDeviceDatabase() {
     g_deviceDatabase.push_back({ L"VXE R1", currentId++, 13652, 62863, L"PAW3395", L"r1", {{ L"1k", 14139, 4229 }} });
     g_deviceDatabase.push_back({ L"VXE R1 NearLink", currentId++, 14139, 4197, L"PAW3395SE", L"r1", {} });
     g_deviceDatabase.push_back({ L"VXE R1 PRO", currentId++, 13652, 62860, L"PAW3395", L"r1-pro", {{ L"1k", 13652, 62858 }} });
+    g_deviceDatabase.push_back({ L"VGN R1 PRO MAX", currentId++, 13652, 62860, L"PAW3395", L"r1-pro-max", {{ L"1k", 13652, 62858 }, { L"4k", 13652, 62725 }} });
     g_deviceDatabase.push_back({ L"VXE R1 PRO MAX", currentId++, 13652, 62860, L"PAW3395", L"r1-pro-max", {{ L"1k", 13652, 62858 }, { L"4k", 13652, 62861 }} });
     g_deviceDatabase.push_back({ L"VXE R1 UlTRA", currentId++, 14139, 4562, L"PAW3395", L"r1", {} });
     g_deviceDatabase.push_back({ L"VXE R1S+", currentId++, 14139, 4228, L"PAW3311", L"r1", {{ L"1k", 14139, 4229 }} });

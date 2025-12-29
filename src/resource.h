@@ -6,6 +6,7 @@
 #define IDM_EXIT                        105
 #define IDM_DIAGNOSTICS                 106
 #define IDM_REFRESH                     1001
+#define IDM_AUTO_DETECT                 1002
 #define IDM_INTERVAL_1                  2001
 #define IDM_INTERVAL_5                  2005
 #define IDM_INTERVAL_15                 2015
@@ -13,6 +14,8 @@
 #define IDC_MY0X44OGEATK                109
 #define IDI_ICON1                       133
 #define IDM_DEVICE_START                3000
+#define IDM_STARTUP                     107
+
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED

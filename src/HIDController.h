@@ -2,17 +2,27 @@
 #include "framework.h"
 
 struct hid_device_;
+struct DiagnosticStats {
+    std::wstring selectedDeviceName;
+    UINT pollingIntervalMinutes;
+    UINT totalTriggers;
+    UINT successfulRefreshes;
+    int lastBatteryLevel;
+    std::wstring lastStatus;
+    SYSTEMTIME startTime;
+};
 
 class HIDController
 {
 public:
+
     HIDController();
     ~HIDController();
 
     bool findAndOpenDevice(unsigned short vendorId, const std::vector<unsigned short>& productIds);
-
     int getBatteryLevel();
-    void runDiagnostics();
+
+    void runDiagnostics(const DiagnosticStats& stats);
 
 private:
     hid_device_* m_device = nullptr;

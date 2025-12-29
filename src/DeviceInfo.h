@@ -13,9 +13,9 @@ struct ReceiverInfo {
 // DeviceInfo Struct
 struct DeviceInfo {
     std::wstring displayName;
-    UINT commandId;
-    unsigned short vendorId;
-    unsigned short wiredPid;
+    UINT commandId = 0;
+    unsigned short vendorId = 0;
+    unsigned short wiredPid = 0;
     std::wstring sensor;
     std::wstring firmwareMark;
     std::vector<ReceiverInfo> receivers;

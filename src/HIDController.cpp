@@ -1,6 +1,6 @@
 ﻿#include "framework.h"
 #include "HIDController.h"
-
+#include "DeviceInfo.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -175,38 +175,81 @@ void HIDController::calculateAtkChecksum(std::vector<uint8_t>& buffer)
     buffer[15] = static_cast<uint8_t>((0x55 - (sum & 0xFF)) & 0xFF);
 }
 
-void HIDController::runDiagnostics()
+void HIDController::runDiagnostics(const DiagnosticStats& stats)
 {
     wchar_t* desktopPath = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, NULL, &desktopPath))) {
-        std::wstring filePath = std::wstring(desktopPath) + L"\\ATK_HIDAPI_Device_Log.txt";
+        std::wstring filePath = std::wstring(desktopPath) + L"\\ATK_Battery_Report.txt";
         CoTaskMemFree(desktopPath);
 
         std::wofstream logFile(filePath);
-        if (!logFile.is_open()) {
-            dbg("runDiagnostics: could not open log file for writing");
-            return;
-        }
+        if (!logFile.is_open()) return;
 
-        logFile << L"HIDAPI device enumeration\n\n";
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+
+        logFile << L"==============================================\n";
+        logFile << L"       ATK BATTERY MONITOR DIAGNOSTICS        \n";
+        logFile << L"==============================================\n\n";
+
+        logFile << L"[APPLICATION STATE]\n";
+        logFile << L"Report Generated: " << now.wYear << L"-" << now.wMonth << L"-" << now.wDay << L" " << now.wHour << L":" << now.wMinute << L"\n";
+        logFile << L"App Started:      " << stats.startTime.wYear << L"-" << stats.startTime.wMonth << L"-" << stats.startTime.wDay << L"\n";
+        logFile << L"Selected Device:  " << stats.selectedDeviceName << L"\n";
+        logFile << L"Poll Interval:    " << stats.pollingIntervalMinutes << L" Minute(s)\n";
+        logFile << L"Total Triggers:   " << stats.totalTriggers << L"\n";
+        logFile << L"Success Count:    " << stats.successfulRefreshes << L"\n";
+        logFile << L"Last Result:      " << stats.lastStatus << L" (Level: " << stats.lastBatteryLevel << L"%)\n\n";
+
+        logFile << L"[HID ENUMERATION]\n";
+        logFile << L"Scanning system for database matches...\n\n";
+
         struct hid_device_info* devs = hid_enumerate(0x0, 0x0);
         struct hid_device_info* cur = devs;
+
         while (cur) {
-            logFile << L"VID: 0x" << std::hex << cur->vendor_id << L"\n";
-            logFile << L"PID: 0x" << std::hex << cur->product_id << L"\n";
-            if (cur->product_string)
-                logFile << L"Product: " << cur->product_string << L"\n";
-            logFile << L"Interface: " << std::dec << cur->interface_number << L"\n";
-            if (cur->path)
-                logFile << L"Path: " << cur->path << L"\n";
-            logFile << L"\n";
+            std::wstring matchNote = L"";
+
+            // CHECK DATABASE FOR MATCHES
+            for (const auto& dbEntry : g_deviceDatabase) {
+                // Check if it matches a Wired PID
+                if (cur->vendor_id == dbEntry.vendorId && cur->product_id == dbEntry.wiredPid) {
+                    matchNote = L">>> [MATCH: " + dbEntry.displayName + L" (Wired Mode)] <<<";
+                    break;
+                }
+
+                // Check if it matches any Receiver PID
+                for (const auto& receiver : dbEntry.receivers) {
+                    if (cur->vendor_id == receiver.vendorId && cur->product_id == receiver.productId) {
+                        matchNote = L">>> [MATCH: " + dbEntry.displayName + L" (" + receiver.type + L" Receiver)] <<<";
+                        break;
+                    }
+                }
+                if (!matchNote.empty()) break;
+            }
+
+            if (!matchNote.empty()) {
+                logFile << matchNote << L"\n";
+            }
+
+            logFile << L"Product:   " << (cur->product_string ? cur->product_string : L"Unknown") << L"\n";
+            logFile << L"VID/PID:   0x" << std::hex << cur->vendor_id << L" / 0x" << cur->product_id << std::dec << L"\n";
+            logFile << L"Interface: " << cur->interface_number << L"\n";
+            logFile << L"Usage Page: 0x" << std::hex << cur->usage_page << L"\n";
+            logFile << L"Usage ID:   0x" << cur->usage << std::dec << L"\n";
+
+            if (cur->path) {
+                logFile << L"Path:      " << cur->path << L"\n";
+            }
+            logFile << L"----------------------------------------------\n";
             cur = cur->next;
         }
+
         hid_free_enumeration(devs);
-        logFile << L"Scan complete.\n";
+        logFile << L"\n[EOF]\n";
         logFile.close();
 
-        std::wstring msg = L"Diagnostics saved to:\n" + filePath;
-        MessageBoxW(NULL, msg.c_str(), L"Diagnostics", MB_OK | MB_ICONINFORMATION);
+        std::wstring msg = L"Detailed diagnostics saved to Desktop:\nATK_Battery_Report.txt";
+        MessageBoxW(NULL, msg.c_str(), L"Diagnostics Complete", MB_OK | MB_ICONINFORMATION);
     }
 }

@@ -4,381 +4,448 @@
 #include <resource.h>
 #include "DeviceInfo.h"
 #include <winreg.h> 
+#include <atomic>
+#include <mutex>
 
 #define MAX_LOADSTRING 100
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_BATTERY_UPDATE_READY (WM_APP + 2)
 
-// Global Variables
-HINSTANCE               hInst;
-WCHAR                   szTitle[MAX_LOADSTRING];
-WCHAR                   szWindowClass[MAX_LOADSTRING];
-HIDController           g_hidController;
-UINT_PTR                g_timerId = 1;
-HICON                   g_hIcon = nullptr;
-UINT                    g_currentMenuId = IDM_INTERVAL_5; // For the interval submenu
-NOTIFYICONDATAW         g_nid = {};
+namespace {
+    struct GdiObj {
+        HGDIOBJ h;
+        GdiObj(HGDIOBJ h) : h(h) {}
+        ~GdiObj() { if (h) DeleteObject(h); }
+        template<typename T>
+        operator T() const { return (T)h; }
+    };
 
-const WCHAR* REGISTRY_KEY_PATH = L"Software\\0x44oge\\ATK Battery Monitor";
-const WCHAR* REGISTRY_VALUE_NAME = L"SelectedDevice";
-
-
-// Forward Declarations
-ATOM                MyRegisterClass(HINSTANCE hInstance);
-BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-void                AddToTray(HWND);
-void                UpdateTrayIcon(HWND, int batteryLevel);
-void                ShowContextMenu(HWND);
-void                SetPollingInterval(HWND, UINT commandId);
-void                QueryBatteryAndUpdateIcon(HWND hWnd);
-void                SaveSelectedDevice(const std::wstring& displayName);
-std::wstring        LoadSelectedDevice();
-
-
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
-	LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-	LoadStringW(hInstance, IDC_MY0X44OGEATK, szWindowClass, MAX_LOADSTRING);
-	MyRegisterClass(hInstance);
-	if (!InitInstance(hInstance, nCmdShow)) { return FALSE; }
-	MSG msg;
-	while (GetMessage(&msg, nullptr, 0, 0)) {
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
-	}
-	return (int)msg.wParam;
+    const WCHAR* REG_PATH_RUN = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const WCHAR* REG_PATH_APP = L"Software\\0x44oge\\ATK Battery Monitor";
+    const WCHAR* REG_VAL_DEVICE = L"SelectedDevice";
+    const WCHAR* STARTUP_VALUE_NAME = L"0x44oge_ATK_Battery_Monitor";
+    const WCHAR* REG_VAL_INTERVAL = L"Interval";
 }
 
-ATOM MyRegisterClass(HINSTANCE hInstance) {
-	WNDCLASSEXW wcex = {};
-	wcex.cbSize = sizeof(WNDCLASSEX);
-	wcex.style = 0;
-	wcex.lpfnWndProc = WndProc;
-	wcex.hInstance = hInstance;
-	wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
-	wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-	wcex.hbrBackground = nullptr;
-	wcex.lpszClassName = szWindowClass;
-	wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_ICON1));
-	return RegisterClassExW(&wcex);
-}
+class BatteryApp {
+public:
+    BatteryApp(HINSTANCE hInst) : m_hInst(hInst), m_isUpdating(false) {
+        LoadStringW(hInst, IDS_APP_TITLE, m_szTitle, MAX_LOADSTRING);
+        LoadStringW(hInst, IDC_MY0X44OGEATK, m_szWindowClass, MAX_LOADSTRING);
+        GetLocalTime(&m_stats.startTime);
+        m_stats.totalTriggers = 0;
+        m_stats.successfulRefreshes = 0;
+        m_stats.lastBatteryLevel = -1;
+        m_stats.lastStatus = L"Initializing";
+    }
 
+    bool Init() {
+        WNDCLASSEXW wcex = { sizeof(WNDCLASSEX) };
+        wcex.lpfnWndProc = BatteryApp::WndProcStatic;
+        wcex.hInstance = m_hInst;
+        wcex.hIcon = LoadIcon(m_hInst, MAKEINTRESOURCE(IDI_ICON1));
+        wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wcex.lpszClassName = m_szWindowClass;
+        RegisterClassExW(&wcex);
 
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
-	hInst = hInstance;
-	HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
-	return hWnd != NULL;
-}
+        m_hWnd = CreateWindowW(m_szWindowClass, m_szTitle, WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, m_hInst, this);
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-	switch (message)
-	{
-	case WM_CREATE:
-		LoadDeviceDatabase(); // Load the device list from DeviceInfo.cpp
+        return m_hWnd != NULL;
+    }
 
-		// Persistence Logic
-		{
-			std::wstring savedDeviceName = LoadSelectedDevice();
-			bool foundSavedDevice = false;
-			if (!savedDeviceName.empty()) {
-				for (const auto& device : g_deviceDatabase) {
-					if (device.displayName == savedDeviceName) {
-						g_selectedDeviceId = device.commandId;
-						foundSavedDevice = true;
-						break;
-					}
-				}
-			}
-			if (!foundSavedDevice) {
-				// Find the default (My Mouse) "ATK A9 Plus Nearlink" and save it
-				for (const auto& device : g_deviceDatabase) {
-					if (device.displayName == L"ATK A9 Plus Nearlink") {
-						g_selectedDeviceId = device.commandId;
-						SaveSelectedDevice(device.displayName);
-						break;
-					}
-				}
-			}
-		}
+    void Run() {
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
 
-		AddToTray(hWnd);
-		SetPollingInterval(hWnd, g_currentMenuId);
-		QueryBatteryAndUpdateIcon(hWnd);
-		break;
+private:
+    HINSTANCE m_hInst;
+    HWND m_hWnd = nullptr;
+    WCHAR m_szTitle[MAX_LOADSTRING];
+    WCHAR m_szWindowClass[MAX_LOADSTRING];
 
-	case WM_TIMER:
-		if (wParam == g_timerId) { QueryBatteryAndUpdateIcon(hWnd); }
-		break;
+    std::mutex m_hidMutex;
+    HIDController m_hidController;
+    NOTIFYICONDATAW m_nid = { sizeof(m_nid) };
+    HICON m_hCurrentIcon = nullptr;
 
-	case WM_TRAYICON:
-		if (lParam == WM_RBUTTONUP) { ShowContextMenu(hWnd); }
-		break;
+    UINT m_currentIntervalId = IDM_INTERVAL_5;
+    std::atomic<bool> m_isUpdating; // Prevents overlapping threads
+    DiagnosticStats m_stats;
 
-	case WM_COMMAND:
-	{
-		int wmId = LOWORD(wParam);
+    // Background Threading Logic
+    void RequestBatteryUpdate() {
+        if (m_isUpdating.exchange(true)) return;
 
-		//  Check if it's a device selection COM
-		if (wmId >= IDM_DEVICE_START && wmId < (IDM_DEVICE_START + g_deviceDatabase.size())) {
-			if (g_selectedDeviceId != wmId) {
-				g_selectedDeviceId = wmId;
-				for (const auto& device : g_deviceDatabase) {
-					if (device.commandId == g_selectedDeviceId) {
-						SaveSelectedDevice(device.displayName);
-						break;
-					}
-				}
-				QueryBatteryAndUpdateIcon(hWnd);
-			}
-			break;
-		}
+        DeviceInfo selected;
+        bool found = false;
+        for (const auto& d : g_deviceDatabase) {
+            if (d.commandId == g_selectedDeviceId) {
+                selected = d;
+                found = true;
+                break;
+            }
+        }
 
-		switch (wmId)
-		{
-		case IDM_EXIT: DestroyWindow(hWnd); break;
-		case IDM_REFRESH: QueryBatteryAndUpdateIcon(hWnd); break;
-		case IDM_INTERVAL_1: case IDM_INTERVAL_5: case IDM_INTERVAL_15: case IDM_INTERVAL_30:
-			SetPollingInterval(hWnd, wmId);
-			break;
-		case IDM_DIAGNOSTICS: g_hidController.runDiagnostics(); break;
-		default: return DefWindowProc(hWnd, message, wParam, lParam);
-		}
-	}
-	break;
+        if (!found) {
+            m_isUpdating = false;
+            UpdateTrayIcon(-1);
+            return;
+        }
 
-	case WM_DESTROY:
-		Shell_NotifyIcon(NIM_DELETE, &g_nid);
-		KillTimer(hWnd, g_timerId);
-		if (g_hIcon) DestroyIcon(g_hIcon);
-		PostQuitMessage(0);
-		break;
+        m_stats.totalTriggers++; // Count attempts
+        m_stats.selectedDeviceName = selected.displayName;
+        // Run query in background thread
+        std::thread([this, selected]() {
+            std::vector<unsigned short> pids;
+            if (selected.wiredPid != 0) pids.push_back(selected.wiredPid);
+            for (const auto& r : selected.receivers) pids.push_back(r.productId);
 
-	default:
-		return DefWindowProc(hWnd, message, wParam, lParam);
-	}
-	return 0;
-}
+            int level = -1;
+            {
+                std::lock_guard<std::mutex> lock(m_hidMutex); // LOCK
+                if (m_hidController.findAndOpenDevice(selected.vendorId, pids)) {
+                    level = m_hidController.getBatteryLevel();
+                }
+            }
 
-void QueryBatteryAndUpdateIcon(HWND hWnd) {
-	DeviceInfo selectedDevice;
-	bool deviceFoundInDb = false;
-	for (const auto& device : g_deviceDatabase) {
-		if (device.commandId == g_selectedDeviceId) {
-			selectedDevice = device;
-			deviceFoundInDb = true;
-			break;
-		}
-	}
+            PostMessage(m_hWnd, WM_BATTERY_UPDATE_READY, (WPARAM)level, 0);
+            }).detach();
+    }
 
-	if (!deviceFoundInDb) {
-		UpdateTrayIcon(hWnd, -1);
-		return;
-	}
+    void SaveInterval(UINT cid) {
+        HKEY hKey;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_APP, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, REG_VAL_INTERVAL, 0, REG_DWORD, (BYTE*)&cid, sizeof(DWORD));
+            RegCloseKey(hKey);
+        }
+    }
 
-	std::vector<unsigned short> pidsToSearch;
-	if (selectedDevice.wiredPid != 0) {
-		pidsToSearch.push_back(selectedDevice.wiredPid);
-	}
-	for (const auto& receiver : selectedDevice.receivers) {
-		pidsToSearch.push_back(receiver.productId);
-	}
+    UINT LoadInterval() {
+        HKEY hKey;
+        UINT cid = IDM_INTERVAL_5; // Default if nothing is found
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_APP, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD val;
+            DWORD sz = sizeof(val);
+            if (RegQueryValueExW(hKey, REG_VAL_INTERVAL, NULL, NULL, (LPBYTE)&val, &sz) == ERROR_SUCCESS) {
+                cid = (UINT)val;
+            }
+            RegCloseKey(hKey);
+        }
+        return cid;
+    }
 
-	int batteryLevel = -1;
-	if (g_hidController.findAndOpenDevice(selectedDevice.vendorId, pidsToSearch)) {
-		batteryLevel = g_hidController.getBatteryLevel();
-	}
+    void AutoDetectDevice() {
+        struct hid_device_info* devs = hid_enumerate(0x0, 0x0);
+        struct hid_device_info* cur = devs;
+        bool foundMatch = false;
 
-	UpdateTrayIcon(hWnd, batteryLevel);
-}
+        while (cur) {
+            for (const auto& dbEntry : g_deviceDatabase) {
+                bool isWired = (cur->vendor_id == dbEntry.vendorId && cur->product_id == dbEntry.wiredPid);
+                bool isReceiver = false;
 
+                for (const auto& receiver : dbEntry.receivers) {
+                    if (cur->vendor_id == receiver.vendorId && cur->product_id == receiver.productId) {
+                        isReceiver = true;
+                        break;
+                    }
+                }
 
-void AddToTray(HWND hWnd)
-{
-	g_nid.cbSize = sizeof(g_nid);
-	g_nid.hWnd = hWnd;
-	g_nid.uID = 1;
-	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-	g_nid.uCallbackMessage = WM_TRAYICON;
-	g_nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_ICON1));
-	wcscpy_s(g_nid.szTip, L"ATK Battery Status: Initializing...");
-	Shell_NotifyIcon(NIM_ADD, &g_nid);
-}
+                if (isWired || isReceiver) {
+                    g_selectedDeviceId = dbEntry.commandId;
+                    SaveSelectedDevice(dbEntry.displayName);
+                    foundMatch = true;
+                    break;
+                }
+            }
+            if (foundMatch) break;
+            cur = cur->next;
+        }
 
-void UpdateTrayIcon(HWND hWnd, int batteryLevel)
-{
-	// batteryLevel = 100;
-	std::wstring text = (batteryLevel >= 0) ? std::to_wstring(batteryLevel) : L"X";
+        hid_free_enumeration(devs);
 
-	// CREATE BLANK CANVAS
-	const int iconSizeX = GetSystemMetrics(SM_CXSMICON);
-	const int iconSizeY = GetSystemMetrics(SM_CYSMICON);
+        if (foundMatch) {
+            RequestBatteryUpdate(); // Refresh immediately with the new device
+        }
+        else {
+            MessageBoxW(m_hWnd, L"No matching ATK/VGN device found.\nPlease ensure your mouse is turned on or plugged in.",
+                L"Auto-Detect", MB_OK | MB_ICONINFORMATION);
+        }
+    }
 
-	HDC hdcScreen = GetDC(NULL);
-	HDC hdcMem = CreateCompatibleDC(hdcScreen);
-	HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, iconSizeX, iconSizeY);
-	HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
-	RECT rect = { 0, 0, iconSizeX, iconSizeY };
+    // UI & Tray Logic
+    void UpdateTrayIcon(int batteryLevel) {
+        std::wstring text = (batteryLevel >= 0) ? std::to_wstring(batteryLevel) : L"X";
+        const int iconSize = GetSystemMetrics(SM_CXSMICON);
 
-	// DRAW THE BACKGROUND
-	HBRUSH hBrush;
-	if (batteryLevel < 0) { hBrush = CreateSolidBrush(RGB(128, 128, 128)); } // Grey
-	else if (batteryLevel <= 20) { hBrush = CreateSolidBrush(RGB(210, 43, 43)); } // Red
-	else if (batteryLevel > 95) { hBrush = CreateSolidBrush(RGB(0, 150, 255)); } // Blue
-	else { hBrush = CreateSolidBrush(RGB(46, 139, 87)); } // Green
+        HDC hdcScreen = GetDC(NULL);
+        HDC hdcMem = CreateCompatibleDC(hdcScreen);
+        GdiObj hBitmap = CreateCompatibleBitmap(hdcScreen, iconSize, iconSize);
+        GdiObj hMonoMask = CreateBitmap(iconSize, iconSize, 1, 1, NULL);
+        ReleaseDC(NULL, hdcScreen);
 
-	FillRect(hdcMem, &rect, hBrush);
-	DeleteObject(hBrush);
+        {
+            HGDIOBJ hOldBitmap = SelectObject(hdcMem, hBitmap);
+            RECT rect = { 0, 0, iconSize, iconSize };
 
-	// DYNAMICALLY SIZE AND DRAW THE TEXT
-	SetBkMode(hdcMem, TRANSPARENT);
-	SetTextColor(hdcMem, RGB(255, 255, 255));
+            // temporary scope for the brush
+            {
+                GdiObj hBrush = CreateSolidBrush(
+                    (batteryLevel < 0) ? RGB(128, 128, 128) :
+                    (batteryLevel <= 20) ? RGB(210, 43, 43) :
+                    (batteryLevel > 95) ? RGB(0, 150, 255) : RGB(46, 139, 87));
+                FillRect(hdcMem, &rect, hBrush);
+            }
 
-	HFONT hFont = NULL;
+            SetBkMode(hdcMem, TRANSPARENT);
 
-	// Start with the largest desired font size and shrink until the text fits.
-	for (int pointSize = 15; pointSize >= 7; pointSize--) {
-		// Create a font of the current test size.
-		int fontSize = -MulDiv(pointSize, GetDeviceCaps(hdcMem, LOGPIXELSY), 72);
-		hFont = CreateFontW(fontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-			NONANTIALIASED_QUALITY, DEFAULT_PITCH, L"Arial"); // Segoe UI or Arial? also CLEARTYPE_QUALITY or NONANTIALIASED_QUALITY
+            HFONT hFontRaw = NULL;
+            for (int pointSize = 15; pointSize >= 7; pointSize--) {
+                int fontSize = -MulDiv(pointSize, GetDeviceCaps(hdcMem, LOGPIXELSY), 72);
+                hFontRaw = CreateFontW(fontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    NONANTIALIASED_QUALITY, DEFAULT_PITCH, L"Arial");
 
-		HGDIOBJ hOldFont = SelectObject(hdcMem, hFont);
+                HGDIOBJ hOldFont = SelectObject(hdcMem, hFontRaw);
+                RECT textRect = { 0, 0, 0, 0 };
+                DrawTextW(hdcMem, text.c_str(), -1, &textRect, DT_CALCRECT | DT_SINGLELINE);
+                SelectObject(hdcMem, hOldFont);
 
-		// Calculate the text dimensions without drawing it.
-		RECT textRect = { 0, 0, 0, 0 };
-		DrawTextW(hdcMem, text.c_str(), -1, &textRect, DT_CALCRECT | DT_SINGLELINE);
+                if ((textRect.right - textRect.left) < iconSize) break;
+                DeleteObject(hFontRaw); hFontRaw = NULL;
+            }
 
-		SelectObject(hdcMem, hOldFont);
+            if (hFontRaw) {
+                GdiObj hFont = hFontRaw; // WRAP FOR AUTO-DELETE
+                HGDIOBJ hOldFont = SelectObject(hdcMem, hFont);
+                SetTextColor(hdcMem, RGB(0, 0, 0));
+                RECT shadowRect = rect; OffsetRect(&shadowRect, 1, 1);
+                DrawTextW(hdcMem, text.c_str(), -1, &shadowRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SetTextColor(hdcMem, RGB(255, 255, 255));
+                DrawTextW(hdcMem, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdcMem, hOldFont);
+            }
 
-		// Check if it fits within the icon
-		if ((textRect.right - textRect.left) < (iconSizeX)) {
-			break;
-		}
+            SelectObject(hdcMem, hOldBitmap);
+        }
 
-		// It didn't fit. Clean up this font and the loop will try the next smaller size.
-		DeleteObject(hFont);
-		hFont = NULL;
-	}
+        ICONINFO ii = {};
+        ii.fIcon = TRUE;
+        ii.hbmMask = (HBITMAP)hMonoMask;
+        ii.hbmColor = (HBITMAP)hBitmap;
 
-	// Draw the text for real W drop shadow
-	if (hFont) {
-		HGDIOBJ hOldFont = SelectObject(hdcMem, hFont);
+        HICON newIcon = CreateIconIndirect(&ii);
 
-		RECT finalDrawRect = rect;
-		OffsetRect(&finalDrawRect, 0, 0);
+        DeleteDC(hdcMem);
 
-		RECT shadowRect = finalDrawRect;
-		OffsetRect(&shadowRect, 1, 1);
-		SetTextColor(hdcMem, RGB(0, 0, 0));
-		DrawTextW(hdcMem, text.c_str(), -1, &shadowRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (m_hCurrentIcon) DestroyIcon(m_hCurrentIcon);
+        m_hCurrentIcon = newIcon;
 
-		SetTextColor(hdcMem, RGB(255, 255, 255));
-		DrawTextW(hdcMem, text.c_str(), -1, &finalDrawRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        m_nid.uFlags = NIF_ICON | NIF_TIP;
+        m_nid.hIcon = m_hCurrentIcon;
+        std::wstring tooltip = L"ATK Battery: " + ((batteryLevel >= 0) ? std::to_wstring(batteryLevel) + L"%" : L"Disconnected");
+        wcscpy_s(m_nid.szTip, tooltip.c_str());
+        Shell_NotifyIcon(NIM_MODIFY, &m_nid);
+    }
 
-		SelectObject(hdcMem, hOldFont);
-	}
+    // Registry Helpers
+    void SaveSelectedDevice(const std::wstring& name) {
+        HKEY hKey;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_APP, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, REG_VAL_DEVICE, 0, REG_SZ, (BYTE*)name.c_str(), (DWORD)((name.length() + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+    }
 
-	// CONVERT TO ICON & CLEAN UP GDI OBJECTS
-	ICONINFO ii = {};
-	ii.fIcon = TRUE;
-	ii.hbmColor = hBitmap;
-	ii.hbmMask = hBitmap;
-	if (g_hIcon) DestroyIcon(g_hIcon);
-	g_hIcon = CreateIconIndirect(&ii);
+    std::wstring LoadSelectedDevice() {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_APP, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            wchar_t buf[256]; DWORD sz = sizeof(buf);
+            if (RegQueryValueExW(hKey, REG_VAL_DEVICE, NULL, NULL, (LPBYTE)buf, &sz) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return buf;
+            }
+            RegCloseKey(hKey);
+        }
+        return L"";
+    }
 
-	SelectObject(hdcMem, hOldBitmap);
-	DeleteObject(hBitmap);
-	if (hFont) {
-		DeleteObject(hFont);
-	}
-	DeleteDC(hdcMem);
-	ReleaseDC(NULL, hdcScreen);
+    bool IsStartupEnabled() {
+        HKEY hKey; bool res = false;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_RUN, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            res = (RegQueryValueExW(hKey, STARTUP_VALUE_NAME, NULL, NULL, NULL, NULL) == ERROR_SUCCESS);
+            RegCloseKey(hKey);
+        }
+        return res;
+    }
 
-	// UPDATE THE SYSTEM TRAY ICON
-	g_nid.uFlags = NIF_ICON | NIF_TIP;
-	g_nid.hIcon = g_hIcon;
-	std::wstring tooltip = L"ATK Battery: " + ((batteryLevel >= 0) ? std::to_wstring(batteryLevel) + L"%" : L"Disconnected");
-	wcscpy_s(g_nid.szTip, tooltip.c_str());
+    void SetStartup(bool enable) {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_RUN, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+            if (enable) {
+                WCHAR path[MAX_PATH]; GetModuleFileNameW(NULL, path, MAX_PATH);
+                std::wstring cmd = L"\"" + std::wstring(path) + L"\"";
+                RegSetValueExW(hKey, STARTUP_VALUE_NAME, 0, REG_SZ, (BYTE*)cmd.c_str(), (DWORD)((cmd.length() + 1) * sizeof(wchar_t)));
+            }
+            else {
+                RegDeleteValueW(hKey, STARTUP_VALUE_NAME);
+            }
+            RegCloseKey(hKey);
+        }
+    }
 
-	Shell_NotifyIcon(NIM_MODIFY, &g_nid);
-}
+    void SetTimerInterval(HWND hWnd, UINT cid) {
+        m_currentIntervalId = cid; // Save to Registry
+        SaveInterval(cid);
 
-void ShowContextMenu(HWND hWnd) {
-	POINT pt; GetCursorPos(&pt);
-	HMENU hMenu = CreatePopupMenu();
+        int mins = (cid == IDM_INTERVAL_1) ? 1 : (cid == IDM_INTERVAL_15) ? 15 : (cid == IDM_INTERVAL_30) ? 30 : 5;
 
-	HMENU hDeviceSubMenu = CreatePopupMenu();
-	for (const auto& device : g_deviceDatabase) {
-		AppendMenuW(hDeviceSubMenu,
-			(g_selectedDeviceId == device.commandId) ? (MF_STRING | MF_CHECKED) : MF_STRING,
-			device.commandId,
-			device.displayName.c_str());
-	}
+        m_stats.pollingIntervalMinutes = mins; // SAVE TO STATS
+        m_hWnd = hWnd; //unnecessary but imma keep it for now
+        SetTimer(hWnd, 1, 1000 * 60 * mins, NULL);
+    }
 
-	HMENU hIntervalSubMenu = CreatePopupMenu();
-	AppendMenuW(hIntervalSubMenu, (g_currentMenuId == IDM_INTERVAL_1) ? (MF_STRING | MF_CHECKED) : MF_STRING, IDM_INTERVAL_1, L"1 Minute");
-	AppendMenuW(hIntervalSubMenu, (g_currentMenuId == IDM_INTERVAL_5) ? (MF_STRING | MF_CHECKED) : MF_STRING, IDM_INTERVAL_5, L"5 Minutes");
-	AppendMenuW(hIntervalSubMenu, (g_currentMenuId == IDM_INTERVAL_15) ? (MF_STRING | MF_CHECKED) : MF_STRING, IDM_INTERVAL_15, L"15 Minutes");
-	AppendMenuW(hIntervalSubMenu, (g_currentMenuId == IDM_INTERVAL_30) ? (MF_STRING | MF_CHECKED) : MF_STRING, IDM_INTERVAL_30, L"30 Minutes");
+    void ShowMenu() {
+        POINT pt; GetCursorPos(&pt);
+        HMENU hMenu = CreatePopupMenu();
+        HMENU hDev = CreatePopupMenu();
+        HMENU hInt = CreatePopupMenu();
 
-	HMENU hDiagMenu = CreatePopupMenu();
-	AppendMenuW(hDiagMenu, MF_STRING, IDM_DIAGNOSTICS, L"Log All HID Devices to Desktop");
+        for (const auto& d : g_deviceDatabase)
+            AppendMenuW(hDev, (g_selectedDeviceId == d.commandId ? MF_CHECKED : 0) | MF_STRING, d.commandId, d.displayName.c_str());
 
-	AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDeviceSubMenu, L"Select Device");
-	AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(hMenu, MF_STRING, IDM_REFRESH, L"Refresh Now");
-	AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hIntervalSubMenu, L"Interval");
-	AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDiagMenu, L"Diagnostics");
-	AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
+        AppendMenuW(hInt, (m_currentIntervalId == IDM_INTERVAL_1 ? MF_CHECKED : 0), IDM_INTERVAL_1, L"1 Minute");
+        AppendMenuW(hInt, (m_currentIntervalId == IDM_INTERVAL_5 ? MF_CHECKED : 0), IDM_INTERVAL_5, L"5 Minutes");
+        AppendMenuW(hInt, (m_currentIntervalId == IDM_INTERVAL_15 ? MF_CHECKED : 0), IDM_INTERVAL_15, L"15 Minutes");
+        AppendMenuW(hInt, (m_currentIntervalId == IDM_INTERVAL_30 ? MF_CHECKED : 0), IDM_INTERVAL_30, L"30 Minutes");
 
-	SetForegroundWindow(hWnd);
-	TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
-	PostMessage(hWnd, WM_NULL, 0, 0);
-	DestroyMenu(hMenu);
-}
+        AppendMenuW(hMenu, MF_STRING, IDM_AUTO_DETECT, L"Auto-Detect Device");
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDev, L"Select Device Manually");
 
-void SaveSelectedDevice(const std::wstring& displayName) {
-	HKEY hKey;
-	if (RegCreateKeyExW(HKEY_CURRENT_USER, REGISTRY_KEY_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-		RegSetValueExW(hKey, REGISTRY_VALUE_NAME, 0, REG_SZ,
-			(const BYTE*)displayName.c_str(),
-			(DWORD)((displayName.length() + 1) * sizeof(wchar_t)));
-		RegCloseKey(hKey);
-	}
-}
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, 0);
+        AppendMenuW(hMenu, MF_STRING, IDM_REFRESH, L"Refresh Now");
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hInt, L"Interval");
+        AppendMenuW(hMenu, (IsStartupEnabled() ? MF_CHECKED : 0) | MF_STRING, IDM_STARTUP, L"Start with Windows");
+        AppendMenuW(hMenu, MF_STRING, IDM_DIAGNOSTICS, L"Log Diagnostics");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, 0);
+        AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
-std::wstring LoadSelectedDevice() {
-	HKEY hKey;
-	if (RegOpenKeyExW(HKEY_CURRENT_USER, REGISTRY_KEY_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-		wchar_t buffer[256];
-		DWORD bufferSize = sizeof(buffer);
-		if (RegQueryValueExW(hKey, REGISTRY_VALUE_NAME, NULL, NULL, (LPBYTE)buffer, &bufferSize) == ERROR_SUCCESS) {
-			RegCloseKey(hKey);
-			return std::wstring(buffer);
-		}
-		RegCloseKey(hKey);
-	}
-	return L"";
-}
+        SetForegroundWindow(m_hWnd);
+        TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hWnd, NULL);
+        DestroyMenu(hMenu);
+    }
 
+    // Message Processing
+    static LRESULT CALLBACK WndProcStatic(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
+        BatteryApp* pApp = nullptr;
+        if (msg == WM_NCCREATE) {
+            pApp = (BatteryApp*)((LPCREATESTRUCT)lp)->lpCreateParams;
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pApp);
+        }
+        else {
+            pApp = (BatteryApp*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+        }
+        return pApp ? pApp->HandleMessage(hWnd, msg, wp, lp) : DefWindowProc(hWnd, msg, wp, lp);
+    }
 
-void SetPollingInterval(HWND hWnd, UINT commandId)
-{
-	g_currentMenuId = commandId;
+    LRESULT HandleMessage(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
+        switch (msg) {
+            case WM_CREATE:
+                m_hWnd = hWnd;
+                LoadDeviceDatabase();
+                m_nid.hWnd = hWnd; m_nid.uID = 1; m_nid.uCallbackMessage = WM_TRAYICON;
+                m_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+                m_nid.hIcon = LoadIcon(m_hInst, MAKEINTRESOURCE(IDI_ICON1));
+                Shell_NotifyIcon(NIM_ADD, &m_nid);
 
-	// Translate the command ID to a time value
-	int minutes;
-	switch (commandId)
-	{
-	case IDM_INTERVAL_1:  minutes = 1; break;
-	case IDM_INTERVAL_5:  minutes = 5; break;
-	case IDM_INTERVAL_15: minutes = 15; break;
-	case IDM_INTERVAL_30: minutes = 30; break;
-	default: minutes = 5; break; // Future proof safety ig
+                // Persistence
+                {
+                    std::wstring saved = LoadSelectedDevice();
+                    for (const auto& d : g_deviceDatabase) {
+                        if (d.displayName == saved || (saved.empty() && d.displayName == L"ATK A9 Plus Nearlink")) {
+                            g_selectedDeviceId = d.commandId;
+                            break;
+                        }
+                    }
+                }
+                m_currentIntervalId = LoadInterval();
+                SetTimerInterval(hWnd, m_currentIntervalId);
+                RequestBatteryUpdate();
+                return 0;
 
-	}
+            case WM_BATTERY_UPDATE_READY:
+            {
+                int level = (int)wp;
+                m_isUpdating = false;
 
-	KillTimer(hWnd, g_timerId);
-	SetTimer(hWnd, g_timerId, 1000 * 60 * minutes, NULL);
+                // Update Diagnostics Stats
+                m_stats.lastBatteryLevel = level;
+                if (level >= 0) {
+                    m_stats.successfulRefreshes++;
+                    m_stats.lastStatus = L"Success";
+                }
+                else {
+                    m_stats.lastStatus = L"Failed (Device Not Found or Timed Out)";
+                }
+
+                UpdateTrayIcon(level);
+                return 0;
+            }
+
+            case WM_TIMER: RequestBatteryUpdate(); return 0;
+            case WM_TRAYICON: if (lp == WM_RBUTTONUP) ShowMenu(); return 0;
+            case WM_COMMAND:
+            {
+                UINT id = LOWORD(wp); // stackoverflow: LOWORD for safety x64 x86
+
+                if (id == IDM_AUTO_DETECT) {
+                    AutoDetectDevice();
+                }
+                else if (id >= IDM_DEVICE_START && id < IDM_DEVICE_START + g_deviceDatabase.size()) {
+                    g_selectedDeviceId = id;
+                    for (const auto& d : g_deviceDatabase) {
+                        if (d.commandId == id) {
+                            SaveSelectedDevice(d.displayName);
+                            break;
+                        }
+                    }
+                    RequestBatteryUpdate();
+                }
+                else {
+                    switch (id) {
+                    case IDM_EXIT: DestroyWindow(hWnd); break;
+                    case IDM_REFRESH: RequestBatteryUpdate(); break;
+                    case IDM_INTERVAL_1: case IDM_INTERVAL_5: case IDM_INTERVAL_15: case IDM_INTERVAL_30:
+                        SetTimerInterval(hWnd, id); break;
+                    case IDM_STARTUP: SetStartup(!IsStartupEnabled()); break;
+                    case IDM_DIAGNOSTICS: {
+                        std::lock_guard<std::mutex> lock(m_hidMutex);
+                        m_hidController.runDiagnostics(m_stats);
+                        break;
+                    }
+                    }
+                }
+                return 0;
+            }
+
+            case WM_DESTROY:
+                Shell_NotifyIcon(NIM_DELETE, &m_nid);
+                if (m_hCurrentIcon) DestroyIcon(m_hCurrentIcon);
+                PostQuitMessage(0);
+                return 0;
+        }
+        return DefWindowProc(hWnd, msg, wp, lp);
+    }
+};
+
+int APIENTRY wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nShowCmd) {
+    BatteryApp app(hInst);
+    if (!app.Init()) return FALSE;
+    app.Run();
+    return 0;
 }
