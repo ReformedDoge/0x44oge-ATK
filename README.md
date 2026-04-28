@@ -44,7 +44,7 @@ The database includes the following devices. While the protocol is standard acro
 | Device Name | Tested? |
 | :--- | :---: |
 | **ATK A9 Plus** (with 1K dongle) | ✅ |
-| **VXE MAD R MAJOR +** (with 8K dongle) | ✅ |
+| **VXE MAD R MAJOR+** (with 8K dongle) | ✅ |
 | **VXE MAD R MAJOR** (with 8K dongle) | ✅ |
 | **VGN R1 PRO MAX** (with 4K dongle) | ✅ |
 | **VXE R1 NearLink** (with 1K dongle) | ✅ |
